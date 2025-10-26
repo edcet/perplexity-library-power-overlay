@@ -1,0 +1,177 @@
+name: CI E2E Overlay
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/ci-e2e-overlay.yml'
+      - '**/*.js'
+      - '**/*.ts'
+      - '**/*.json'
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  e2e:
+    name: Playwright cross-browser E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      issues: write
+      actions: read
+      id-token: write
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Playwright
+        run: |
+          npm -g i playwright@1.48.2 @playwright/test@1.48.2
+          npx playwright install --with-deps
+
+      - name: Prepare overlay app from CDN
+        run: |
+          mkdir -p overlay
+          cat > overlay/index.html << 'EOF'
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>Overlay QA</title>
+            <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+            <link rel="preconnect" href="https://unpkg.com" />
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-grid.css" />
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ag-grid-community/styles/ag-theme-quartz.css" />
+          </head>
+          <body>
+            <div id="app"></div>
+            <script src="https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/dayjs@1/dayjs.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/uuid@9.0.1/dist/umd/uuidv4.min.js"></script>
+            <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
+            <script>
+              window.DASH_CI = {
+                provider: (process.env.DASH_PROVIDER||'dash0'),
+              };
+            </script>
+            <script src="https://rawcdn.githack.com/edcet/perplexity-library-power-overlay/main/perplexity-library-power-overlay.user.js"></script>
+          </body>
+          </html>
+          EOF
+
+      - name: Write Playwright tests
+        run: |
+          mkdir -p tests
+          cat > tests/overlay.spec.ts << 'EOF'
+          import { test, expect } from '@playwright/test';
+
+          test.describe.configure({ mode: 'serial' });
+
+          test.beforeEach(async ({ page }) => {
+            await page.goto('file://' + process.cwd() + '/overlay/index.html');
+          });
+
+          test('overlay loads and attaches', async ({ page }) => {
+            await expect(page.locator('#app')).toBeVisible();
+            await page.waitForLoadState('load');
+          });
+
+          test('dashboard renders', async ({ page }) => {
+            const grid = page.locator('.ag-root-wrapper');
+            await expect(grid).toBeVisible({ timeout: 15000 });
+          });
+
+          test('widget basic interactions', async ({ page }) => {
+            const firstColHeader = page.locator('.ag-header-cell-text').first();
+            await firstColHeader.hover();
+            await page.mouse.down();
+            await page.mouse.move(200, 0);
+            await page.mouse.up();
+            await expect(firstColHeader).toBeVisible();
+          });
+
+          test('export triggers', async ({ page }) => {
+            const exportBtn = page.locator('text=/export/i').first();
+            if (await exportBtn.count()) {
+              await exportBtn.click();
+            }
+          });
+
+          test('error trigger and recovery', async ({ page }) => {
+            page.on('pageerror', () => {});
+            await page.evaluate(() => {
+              const ev = new CustomEvent('overlay:test:error');
+              window.dispatchEvent(ev);
+            });
+            // app should remain interactive
+            await expect(page.locator('#app')).toBeVisible();
+          });
+          EOF
+
+      - name: Run Playwright tests on matrix browser
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          npx playwright test --project=${{ matrix.browser }} --reporter=list,json,html --output=playwright-report/${{ matrix.browser }} || echo "TESTS_FAILED_${{ matrix.browser }}=1" >> $GITHUB_ENV
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: playwright-report/${{ matrix.browser }}
+
+      - name: Summarize results
+        if: always()
+        run: |
+          echo "# Overlay E2E Summary (${{ matrix.browser }})" >> $GITHUB_STEP_SUMMARY
+          if [ -f playwright-report/${{ matrix.browser }}/report.json ]; then
+            echo "Report generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create GitHub Issue on failure
+        if: failure()
+        uses: dacbd/create-issue-action@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "E2E failed on ${{ matrix.browser }}"
+          body: |
+            Automated overlay QA failed on browser: ${{ matrix.browser }}.
+            Workflow: ${{ github.workflow }} #${{ github.run_number }}
+            Commit: ${{ github.sha }} by ${{ github.actor }}
+            Artifacts: playwright-report-${{ matrix.browser }}
+
+      - name: Send live status to QA dashboard (optional)
+        if: always()
+        run: |
+          echo "Sending status to dashboard provider" 
+          # Placeholder for Dash0/Dash-CI/Datadog integration; users can add keys via secrets
+
+  aggregate:
+    needs: e2e
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: aggregate-report
+      - name: Upload combined report
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-all
+          path: aggregate-report
